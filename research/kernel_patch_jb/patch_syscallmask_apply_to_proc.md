@@ -5,7 +5,7 @@
 - Re-analysis date: `2026-03-06`
 - Scope: `kernelcache.research.vphone600`
 - Prior notes for this patch are treated as untrusted unless restated below.
-- Current conclusion: the shipped/recorded C22 implementation does **not** patch the syscall-mask apply path. Its verified writes land in `_profile_syscallmask_destroy` under an underflow-panic slow path, so the old patch is effectively a misidentification with little or no normal-path effect.
+- Current conclusion: the old repo C22 implementation was a misidentification that patched `_profile_syscallmask_destroy` under an underflow-panic slow path. As of `2026-03-06`, `scripts/patchers/kernel_jb_patch_syscallmask.py` has been rebuilt to target the real syscallmask apply wrapper structurally and recreate the upstream C22 behavior (mutate mask bytes to all-ones, then continue into the normal setter path). User-side restore/boot validation succeeded on `2026-03-06`.
 
 ## What This Mechanism Actually Does
 
@@ -337,6 +337,26 @@ Most plausible failure modes if this family is patched incorrectly:
 - a broad setter patch corrupts proc/task RO state outside the intended sandbox apply path
 
 The proposed three-site `mov x2, xzr` strategy is the narrowest approach found so far that still achieves the intended jailbreak effect.
+
+## Repository Implementation Status
+
+As of `2026-03-06`, the repository implementation has been updated to follow the revalidated C22 design:
+
+- locate the high-level apply manager from the three `failed to apply ... mask` strings
+- identify the shared low wrapper that is called with `which = 0/1/2`
+- replace the wrapper's pre-setter helper `BL` with `mov x17, x0`
+- replace the wrapper's tail `B` with a branch to a code cave
+- in the cave, build an all-ones blob, call the structurally-derived mutation helper, then tail-branch back into the normal setter core
+
+Focused dry-run validation on `ipsws/PCC-CloudOS-26.1-23B85/kernelcache.research.vphone600` now emits exactly 3 writes:
+
+- `0x02395530` — `mov x17,x0 [syscallmask C22 save RO selector]`
+- `0x023955E8` — `b cave [syscallmask C22 mutate mask then setter]`
+- `0x00AB1720` — `syscallmask C22 cave (ff blob 0x100 + structural mutator + setter tail)`
+
+This restores the intended patch class while avoiding the previous false-positive hit on `_profile_syscallmask_destroy`.
+
+User validation note: boot succeeded with the rebuilt C22 enabled on `2026-03-06`.
 
 ## Bottom Line
 

@@ -84,7 +84,7 @@ Current default schedule note (2026-03-06): `patch_cred_label_update_execve` rem
 | JB-04 | C     | `patch_hook_cred_label_update_execve` | currently mis-targets `sub_FFFFFE00093D2CE4`; intended target `_hook_cred_label_update_execve` | Disable sandbox exec-time label update + syscall-mask application; keep disabled until retargeted |     -      |
 | JB-05 | C     | `patch_kcall10`                       | `sysent[439]` (`SYS_kas_info` replacement) | Kernel arbitrary call from userspace                    |     Y      |
 | JB-06 | B     | `patch_post_validation_additional`    | `_postValidation` (additional)             | Disable SHA256-only hash-type reject                    |     Y      |
-| JB-07 | C     | `patch_syscallmask_apply_to_proc`     | `_proc_apply_syscall_masks`                | Clear Unix/Mach/KOBJ masks via NULL writes; old `_profile_syscallmask_destroy` hit was wrong |     -      |
+| JB-07 | C     | `patch_syscallmask_apply_to_proc`     | syscallmask apply wrapper (`_proc_apply_syscall_masks` path) | Rebuilt C22: mutate Unix/Mach/KOBJ masks to all-ones via structural cave, then continue into setter |     Y      |
 | JB-08 | A     | `patch_task_conversion_eval_internal` | `_task_conversion_eval_internal`           | Allow task conversion                                   |     Y      |
 | JB-09 | A     | `patch_sandbox_hooks_extended`        | Sandbox MACF ops (extended)                | Stub remaining 30+ sandbox hooks (incl. IOKit 201..210) |     Y      |
 | JB-10 | A     | `patch_iouc_failed_macf`              | IOUC MACF shared gate                      | Bypass shared IOUserClient MACF deny path               |     Y      |
@@ -200,6 +200,7 @@ JB-24 note (2026-03-06): the old derived matcher hit the `VM_PAGE_CONSUME_CLUSTE
   - 2026-03-06 follow-up: `patch_bsd_init_auth` was retargeted after confirming the old matcher was hitting unrelated code; keep disabled in default schedule until a fresh clean-baseline boot test passes.
   - Final case: `[19/19] patch_syscallmask_apply_to_proc` (`PASS`).
   - 2026-03-06 re-analysis: that historical `PASS` is now treated as a false positive for functionality, because the recorded bytes landed at `0xfffffe00093ae6e4`/`0xfffffe00093ae6e8` inside `_profile_syscallmask_destroy` underflow handling, not in `_proc_apply_syscall_masks`.
+  - 2026-03-06 code update: `scripts/patchers/kernel_jb_patch_syscallmask.py` was rebuilt to target the real syscallmask apply wrapper structurally and now dry-runs on `PCC-CloudOS-26.1-23B85 kernelcache.research.vphone600` with 3 writes: `0x02395530`, `0x023955E8`, and cave `0x00AB1720`. User-side boot validation succeeded the same day.
   - Observed failure symptom in current failing set: first boot panic before command injection (or boot process early exit).
 - Post-run schedule change (per user request):
   - commented out failing methods from default `KernelJBPatcher._PATCH_METHODS` schedule in `scripts/patchers/kernel_jb.py`:
