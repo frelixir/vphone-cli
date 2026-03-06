@@ -91,7 +91,7 @@ class KernelJBPatcher(
 
     # Group C: Shellcode/trampoline heavy methods.
     _GROUP_C_METHODS = (
-        # "patch_cred_label_update_execve",  # JB-03 / C21 (disabled: reworked on 2026-03-06, pending boot revalidation)
+        "patch_cred_label_update_execve",  # JB-03 / C21 (disabled: reworked on 2026-03-06, pending boot revalidation)
         # "patch_hook_cred_label_update_execve",  # JB-04 / C23 (low-riskized)
         # "patch_kcall10",  # JB-05 / C24 (low-riskized)
         # "patch_syscallmask_apply_to_proc",  # JB-07 / C22
