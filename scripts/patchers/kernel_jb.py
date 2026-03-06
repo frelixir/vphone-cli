@@ -85,7 +85,7 @@ class KernelJBPatcher(
         "patch_spawn_validate_persona",  # JB-21 / B14
         "patch_task_for_pid",  # JB-22 / B15
         "patch_thid_should_crash",  # JB-23 / B20
-        # "patch_vm_fault_enter_prepare",  # JB-24 / B9 (disabled: autotest FAIL rc=2 on 2026-03-06)
+        "patch_vm_fault_enter_prepare",  # JB-24 / B9 (retargeted 2026-03-06 to upstream cs_bypass gate)
         "patch_vm_map_protect",  # JB-25 / B10
     )
 
