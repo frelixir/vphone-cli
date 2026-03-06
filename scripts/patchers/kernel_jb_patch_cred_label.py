@@ -5,6 +5,8 @@ from .kernel_jb_base import asm, _rd32
 
 class KernelJBPatchCredLabelMixin:
     _RET_INSNS = (0xD65F0FFF, 0xD65F0BFF, 0xD65F03C0)
+    _MOV_W0_0_U32 = int.from_bytes(asm("mov w0, #0"), "little")
+    _MOV_W0_1_U32 = int.from_bytes(asm("mov w0, #1"), "little")
     _RELAX_CSMASK = 0xFFFFC0FF
     _RELAX_SETMASK = 0x0000000C
 
@@ -161,7 +163,7 @@ class KernelJBPatchCredLabelMixin:
 
     def _find_cred_label_deny_return(self, func_off, epilogue_off):
         """Find the shared `mov w0,#1` kill-return right before the epilogue."""
-        mov_w0_1 = 0x52800020
+        mov_w0_1 = self._MOV_W0_1_U32
         scan_start = max(func_off, epilogue_off - 0x40)
         for off in range(epilogue_off - 4, scan_start - 4, -4):
             if _rd32(self.raw, off) == mov_w0_1 and off + 4 == epilogue_off:
@@ -184,7 +186,7 @@ class KernelJBPatchCredLabelMixin:
                 continue
             saw_mov_w0_0 = False
             for prev in range(max(func_off, off - 0x10), off, 4):
-                if _rd32(self.raw, prev) == 0x52800000:
+                if _rd32(self.raw, prev) == self._MOV_W0_0_U32:
                     saw_mov_w0_0 = True
                     break
             if saw_mov_w0_0:
