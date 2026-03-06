@@ -85,6 +85,84 @@ Validated behavior from disassembly:
 
 This matches the XNU setter semantics closely enough to trust the mapping.
 
+## PCC 26.1 Upstream-Exact Reconstruction
+
+On the exact PCC 26.1 research kernel matching the historical upstream script, the original C22 chain resolves as follows:
+
+- apply-wrapper entry: `0xfffffe00093994f8` (`sub_FFFFFE00093994F8`)
+- high-level caller: `0xfffffe000939c998` (`sub_FFFFFE000939C998`)
+- upstream patch writes at:
+  - `0xfffffe0009399530` — original `BL` replaced by `mov x17, x0`
+  - `0xfffffe0009399584` — original tail branch replaced by branch to cave
+  - `0xfffffe0007ab5740` — code cave / data blob region
+
+Validated wrapper behavior before patch:
+
+- `sub_FFFFFE000939C998` calls `sub_FFFFFE00093994F8(proc, 0, unix_mask)`
+- then `sub_FFFFFE00093994F8(proc, 1, mach_mask)`
+- then `sub_FFFFFE00093994F8(proc, 2, kobj_mask)`
+- failures map to the three familiar strings:
+  - `failed to apply unix syscall mask`
+  - `failed to apply mach trap mask`
+  - `failed to apply kernel MIG routine mask`
+
+This is the older PCC 26.1 form of the same logic that appears as `_proc_apply_syscall_masks` on the newer kernel.
+
+At the low wrapper level, `sub_FFFFFE00093994F8` does this:
+
+- if `maskptr == NULL`, skip the pre-processing helper
+- otherwise call helper at `0xfffffe0007b761e0` with:
+  - `x0` = zone/RO-mutation selector loaded from `word_FFFFFE0007A58354`
+  - `x1` = backing object/pointer loaded from `qword_FFFFFE0007A58358`
+  - `x2` = original mask pointer
+- then load `x3 = masklen_bits` from a small selector table
+- then tail-branch into setter core at `0xfffffe0007fc7220`
+
+The historical upstream patch hijacks exactly this seam.
+
+### Exact shellcode semantics
+
+Using the original upstream words from the script, the cave body at `0xfffffe0007ab5768` disassembles to:
+
+- preserve original args in `x19..x22`
+- use the saved original helper arg in `x17`
+- compute `ceil(masklen_bits / 8)` in `x4`
+- call helper at `0xfffffe0007b76258`
+- restore original `(proc, which, maskptr, masklen_bits)`
+- branch back into setter core at `0xfffffe0007fc7220`
+
+Crucially, the helper call is made with:
+
+- `x0 = x17`
+- `x1 = x21` (original `maskptr`)
+- `x2 = 0` (offset)
+- `x3 = cave base = 0xfffffe0007ab5740`
+- `x4 = ceil(masklen_bits / 8)`
+
+and the cave base holds a large `0xFF` blob.
+
+That means the upstream patch mutates the pointed-to mask buffer in place so that the first `ceil(masklen_bits / 8)` bytes become `0xFF`, then installs that mask through the normal setter.
+
+### Final semantic conclusion for upstream C22
+
+The original upstream C22 patch is therefore:
+
+- **not** “skip syscallmask apply”
+- **not** “return success early”
+- **not** “clear the mask pointer”
+
+It is:
+
+- **rewrite the mask contents to an all-ones allow mask, then continue through the normal setter path**
+
+This is the closest faithful behavioral description of historical C22.
+
+### Implication for modern reimplementation
+
+If we want to reproduce upstream behavior exactly, the modern patch should preserve the apply/setter path and force the effective Unix/Mach/KOBJ masks to all ones.
+
+If we prefer a smaller and likely safer patch for bring-up, the `NULL`-mask strategy remains attractive, but it is a modern simplification rather than an exact upstream reconstruction.
+
 ## Legacy Upstream Mapping
 
 The pasted legacy script matches the historical upstream `syscallmask` shellcode patch that this repo later labeled as C22.

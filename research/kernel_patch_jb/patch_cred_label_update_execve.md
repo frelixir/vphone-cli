@@ -76,15 +76,20 @@ In short: `_cred_label_update_execve` is on the boot-critical exec path, so turn
 
 ## Repaired Patch Strategy
 
-The new patcher no longer returns from function entry.
+The current C21-v1 patcher no longer returns from function entry and no
+longer hijacks the beginning of the success tail.
 
 Instead it:
 
 1. keeps AMFI's full exec-time logic intact;
-2. locates the final success tail while `x26 == csflags` is still live;
-3. redirects that tail to a small trampoline;
-4. clears only the restrictive execution bits from `*csflags`;
-5. branches back into the original epilogue.
+2. finds the canonical epilogue at `0xFFFFFE000864E390`;
+3. redirects the shared deny return (`0xFFFFFE000864E38C`) and both late
+   success exits (`0xFFFFFE000864E580`, `0xFFFFFE000864E588`) into one
+   common trampoline;
+4. reloads `u_int *csflags` from the function's own stack slot in the cave,
+   so the cave works for both deny and success exits;
+5. clears only the restrictive execution bits from `*csflags`;
+6. forces `w0 = 0` and branches into the original epilogue.
 
 The current trampoline clears this mask:
 
@@ -99,18 +104,138 @@ Bitmask used by the patcher: `0xFFFFC0FF`.
 
 This preserves AMFI's normal validation / entitlement work while removing the sticky exec-time restrictions that are most hostile to jailbreak tooling.
 
+## C21-v1 Scope
+
+This is intentionally the smallest credible C21-only design:
+
+- it does not depend on `patch_amfi_execve_kill_path`;
+- it does not patch function entry;
+- it does not forge `CS_VALID`, `CS_PLATFORM_BINARY`, `CS_ADHOC`, or other
+  high-risk identity bits;
+- it only converts late exits in `_cred_label_update_execve` to success and
+  normalizes the restrictive `0x3F00` cluster.
+
+## C21-v1 Outcome
+
+- User restore testing confirms C21-v1 boots successfully.
+- That result validates the central design assumption: `_cred_label_update_execve`
+  can be patched safely as long as AMFI's main body is preserved and only the
+  final exits are redirected.
+
+## Dry-Run Verification (extracted PCC 26.1 research kernel)
+
+Dry-run patch generation against the extracted raw Mach-O from
+`ipsws/PCC-CloudOS-26.1-23B85/kernelcache.research.vphone600` produced the
+following C21-v1 shape:
+
+- code cave: `0x00AB0F00`
+- shared deny-return branch site: `0x0163C0FC`
+- late success-exit branch sites: `0x0163C2F0`, `0x0163C2F8`
+
+Emitted trampoline body:
+
+- `ldr x26, [x29, #0x18]`
+- `cbz x26, +0x10`
+- `ldr w8, [x26]`
+- `and w8, w8, #0xFFFFC0FF`
+- `str w8, [x26]`
+- `mov w0, #0`
+- `b epilogue`
+
+Observed C21-v1 raw patch count: `10`
+
+- `7` instructions in the trampoline cave
+- `3` patched branch sites in `_cred_label_update_execve`
+
+## C21-v2 Refinement
+
+After C21-v1 boot success, the patch was refined to separate deny and success
+semantics instead of using one common cave for all exits.
+
+### Reason for v2
+
+C21-v1 proved that the late-exit structure is safe enough to boot, but it still
+cleared `0x3F00` on the shared deny path. That is broader than necessary.
+
+C21-v2 narrows that behavior:
+
+- deny exit: force only `w0 = 0`, then return through the original epilogue;
+- success exits: keep the late `csflags` normalization path.
+
+### C21-v2 dry-run shape
+
+- deny cave: `0x00AB02B8`
+- success cave: `0x00AB0F00`
+- deny-return branch site: `0x0163C0FC`
+- late success-exit branch sites: `0x0163C2F0`, `0x0163C2F8`
+
+Observed C21-v2 raw patch count: `12`
+
+- `2` instructions in the deny cave
+- `7` instructions in the success cave
+- `3` patched branch sites in `_cred_label_update_execve`
+
+## C21-v3 Refinement
+
+After preparing the safer split-exit structure in v2, the next experimental
+step adds only the smallest helper-bit subset from the older upstream idea.
+
+### Reason for v3
+
+The old upstream shellcode not only cleared restrictive flags, but also set a
+much broader collection of identity / helper bits. Most of those are too risky
+to restore directly.
+
+C21-v3 keeps the v2 structure and adds only this success-only increment:
+
+- `CS_GET_TASK_ALLOW` (`0x4`)
+- `CS_INSTALLER` (`0x8`)
+
+Combined set mask used by v3: `0x0000000C`
+
+### C21-v3 dry-run shape
+
+- deny cave: `0x00AB02B8`
+- success cave: `0x00AB0F00`
+- deny-return branch site: `0x0163C0FC`
+- late success-exit branch sites: `0x0163C2F0`, `0x0163C2F8`
+
+Observed C21-v3 raw patch count: `13`
+
+- `2` instructions in the deny cave
+- `8` instructions in the success cave
+- `3` patched branch sites in `_cred_label_update_execve`
+
+Success-cave body now becomes:
+
+- `ldr x26, [x29, #0x18]`
+- `cbz x26, +0x10`
+- `ldr w8, [x26]`
+- `and w8, w8, #0xFFFFC0FF`
+- `orr w8, w8, #0xC`
+- `str w8, [x26]`
+- `mov w0, #0`
+- `b epilogue`
+
 ## Intended Effect
 
 After the repaired patch:
 
 - AMFI still runs its normal exec-time hook and keeps boot-critical side effects intact.
-- Exec success remains driven by the existing AMFI flow; kill-return bypass is still handled separately by `patch_amfi_execve_kill_path`.
+- C21 now carries its own late deny→allow transition inside `_cred_label_update_execve`.
 - Successfully launched processes end up with a less restrictive `csflags` set, especially around kill / hard / library-validation style behavior.
 
 This is a much narrower and more defensible jailbreak patch than forcing an unconditional success return at function entry.
 
 ## Current Status
 
-- Patch implementation updated in `scripts/patchers/kernel_jb_patch_cred_label.py`.
-- Default schedule remains disabled in `scripts/patchers/kernel_jb.py` until boot validation is rerun.
-- If this patch still fails, the next suspect is not AMFI's kill return itself, but over-broad `csflags` relaxation semantics for specific early-boot binaries.
+- Patch implementation updated in `scripts/patchers/kernel_jb_patch_cred_label.py` as C21-v3.
+- C21-v1 has already booted successfully in restore testing.
+- Default schedule remains disabled in `scripts/patchers/kernel_jb.py` until C21-v3 restore / boot validation is rerun.
+- Expected dry-run patch shape for C21-v3 is:
+  - 1 deny cave;
+  - 1 success cave;
+  - 1 branch patch at the shared deny return;
+  - 2 branch patches at the two late success exits.
+- The current dry-run matches that expected shape exactly.
+- If C21-v3 regresses boot, the most likely cause is not the split late-exit structure, but the newly added `0xC` helper-bit OR on the success path.

@@ -6,6 +6,7 @@ from .kernel_jb_base import asm, _rd32
 class KernelJBPatchCredLabelMixin:
     _RET_INSNS = (0xD65F0FFF, 0xD65F0BFF, 0xD65F03C0)
     _RELAX_CSMASK = 0xFFFFC0FF
+    _RELAX_SETMASK = 0x0000000C
 
     def _is_cred_label_execve_candidate(self, func_off, anchor_refs):
         """Validate candidate function shape for _cred_label_update_execve."""
@@ -113,23 +114,9 @@ class KernelJBPatchCredLabelMixin:
 
         return fallback
 
-    def _find_cred_label_success_tail(self, func_off):
-        """Locate the final success tail while the csflags pointer is still live.
-
-        On vphone600 AMFI, the last success block looks like:
-          ldr w8, [x26]
-          tst w8, w27
-          ...
-          mov w0, #0
-          ldp x29, x30, [sp, ...]
-
-        We patch the first instruction of that tail so the trampoline can
-        still use x26 (the spilled `u_int *csflags` argument) before the
-        epilogue restores callee-saved registers.
-        """
+    def _find_cred_label_epilogue(self, func_off):
+        """Locate the canonical epilogue start (`ldp x29, x30, [sp, ...]`)."""
         func_end = self._find_func_end(func_off, 0x1000)
-
-        epilogue_off = -1
         for off in range(func_end - 4, func_off, -4):
             d = self._disas_at(off)
             if not d:
@@ -137,42 +124,95 @@ class KernelJBPatchCredLabelMixin:
             i = d[0]
             op = i.op_str.replace(" ", "")
             if i.mnemonic == "ldp" and op.startswith("x29,x30,[sp"):
-                epilogue_off = off
-                break
+                return off
 
-        if epilogue_off < 0:
-            return -1, -1
+        return -1
 
-        tail_off = -1
-        scan_start = max(func_off, epilogue_off - 0x40)
-        for off in range(epilogue_off - 8, scan_start - 4, -4):
-            d0 = self._disas_at(off)
-            d1 = self._disas_at(off + 4)
-            if not d0 or not d1:
+    def _find_cred_label_csflags_ptr_reload(self, func_off):
+        """Recover the stack-based `u_int *csflags` reload used by the function.
+
+        We reuse the same `ldr x26, [x29, #imm]` form in the trampoline so the
+        common C21-v1 cave works for both deny and success exits, even when the
+        live x26 register has not been initialized on a deny-only path.
+        """
+        func_end = self._find_func_end(func_off, 0x1000)
+        for off in range(func_off, func_end, 4):
+            d = self._disas_at(off)
+            if not d:
                 continue
-            i0 = d0[0]
-            i1 = d1[0]
-            op0 = i0.op_str.replace(" ", "")
-            op1 = i1.op_str.replace(" ", "")
-            if i0.mnemonic == "ldr" and op0 == "w8,[x26]" and i1.mnemonic == "tst" and op1 == "w8,w27":
-                tail_off = off
-                break
+            i = d[0]
+            op = i.op_str.replace(" ", "")
+            if i.mnemonic != "ldr" or not op.startswith("x26,[x29"):
+                continue
+            mem_op = i.op_str.split(",", 1)[1].strip()
+            return off, mem_op
 
-        return tail_off, epilogue_off
+        return -1, None
+
+    def _decode_b_target(self, off):
+        """Return target of unconditional `b`, or -1 if instruction is not `b`."""
+        insn = _rd32(self.raw, off)
+        if (insn & 0x7C000000) != 0x14000000:
+            return -1
+        imm26 = insn & 0x03FFFFFF
+        if imm26 & (1 << 25):
+            imm26 -= 1 << 26
+        return off + imm26 * 4
+
+    def _find_cred_label_deny_return(self, func_off, epilogue_off):
+        """Find the shared `mov w0,#1` kill-return right before the epilogue."""
+        mov_w0_1 = 0x52800020
+        scan_start = max(func_off, epilogue_off - 0x40)
+        for off in range(epilogue_off - 4, scan_start - 4, -4):
+            if _rd32(self.raw, off) == mov_w0_1 and off + 4 == epilogue_off:
+                return off
+
+        return -1
+
+    def _find_cred_label_success_exits(self, func_off, epilogue_off):
+        """Find late success edges that already decided to return 0.
+
+        On the current vphone600 AMFI body these are the final `b epilogue`
+        instructions in the success tail, reached after the original
+        `tst/orr/str` cleanup has already run.
+        """
+        exits = []
+        func_end = self._find_func_end(func_off, 0x1000)
+        for off in range(func_off, func_end, 4):
+            target = self._decode_b_target(off)
+            if target != epilogue_off:
+                continue
+            saw_mov_w0_0 = False
+            for prev in range(max(func_off, off - 0x10), off, 4):
+                if _rd32(self.raw, prev) == 0x52800000:
+                    saw_mov_w0_0 = True
+                    break
+            if saw_mov_w0_0:
+                exits.append(off)
+
+        return tuple(exits)
 
     def patch_cred_label_update_execve(self):
-        """Relax exec-time code-signing flags after AMFI finishes normal work.
+        """C21-v3: split late exits and add minimal helper bits on success.
 
-        The old entry-time early return broke boot because it skipped AMFI's
-        normal exec-time processing entirely: cs_blob lookup, analytics,
-        entitlement-derived csflags, and shared-state bookkeeping.
+        This version keeps the boot-safe late-exit structure from v2, but adds
+        a small success-only extension inspired by the older upstream shellcode:
 
-        The repaired strategy keeps the whole AMFI function intact and only
-        redirects the final success tail to a tiny trampoline that clears the
-        restrictive exec flags from `*csflags` before branching into the
-        function's normal epilogue.
+        - keep `_cred_label_update_execve`'s body intact;
+        - redirect the shared deny return into a tiny deny cave that only
+          forces `w0 = 0` and returns through the original epilogue;
+        - redirect the late success exits into a success cave;
+        - reload `u_int *csflags` from the stack only on the success cave;
+        - clear only `CS_HARD|CS_KILL|CS_CHECK_EXPIRATION|CS_RESTRICT|
+          CS_ENFORCEMENT|CS_REQUIRE_LV` on the success cave;
+        - then OR only `CS_GET_TASK_ALLOW|CS_INSTALLER` (`0xC`) on the
+          success cave;
+        - return through the original epilogue in both cases.
+
+        This preserves AMFI's exec-time analytics / entitlement handling and
+        avoids the boot-unsafe entry-time early return used by older variants.
         """
-        self._log("\n[JB] _cred_label_update_execve: tail csflags relax")
+        self._log("\n[JB] _cred_label_update_execve: C21-v3 split exits + helper bits")
 
         func_off = -1
 
@@ -191,45 +231,91 @@ class KernelJBPatchCredLabelMixin:
             self._log("  [-] function not found, skipping shellcode patch")
             return False
 
-        tail_off, epilogue_off = self._find_cred_label_success_tail(func_off)
-        if tail_off < 0 or epilogue_off < 0:
-            self._log("  [-] final success tail not found")
+        epilogue_off = self._find_cred_label_epilogue(func_off)
+        if epilogue_off < 0:
+            self._log("  [-] epilogue not found")
             return False
 
-        cave = self._find_code_cave(20)
-        if cave < 0:
-            self._log("  [-] no code cave found for csflags relax trampoline")
+        deny_off = self._find_cred_label_deny_return(func_off, epilogue_off)
+        if deny_off < 0:
+            self._log("  [-] shared deny return not found")
             return False
 
-        branch_back = self._encode_b(cave + 16, epilogue_off)
-        if not branch_back:
-            self._log("  [-] branch from trampoline back to epilogue is out of range")
+        success_exits = self._find_cred_label_success_exits(func_off, epilogue_off)
+        if not success_exits:
+            self._log("  [-] success exits not found")
             return False
 
-        shellcode = (
-            asm("ldr w8, [x26]")
+        _, csflags_mem_op = self._find_cred_label_csflags_ptr_reload(func_off)
+        if not csflags_mem_op:
+            self._log("  [-] csflags stack reload not found")
+            return False
+
+        deny_cave = self._find_code_cave(8)
+        if deny_cave < 0:
+            self._log("  [-] no code cave found for C21-v3 deny trampoline")
+            return False
+
+        success_cave = self._find_code_cave(32)
+        if success_cave < 0 or success_cave == deny_cave:
+            self._log("  [-] no code cave found for C21-v3 success trampoline")
+            return False
+
+        deny_branch_back = self._encode_b(deny_cave + 4, epilogue_off)
+        if not deny_branch_back:
+            self._log("  [-] branch from deny trampoline back to epilogue is out of range")
+            return False
+
+        success_branch_back = self._encode_b(success_cave + 28, epilogue_off)
+        if not success_branch_back:
+            self._log("  [-] branch from success trampoline back to epilogue is out of range")
+            return False
+
+        deny_shellcode = asm("mov w0, #0") + deny_branch_back
+        success_shellcode = (
+            asm(f"ldr x26, {csflags_mem_op}")
+            + asm("cbz x26, #0x10")
+            + asm("ldr w8, [x26]")
             + asm(f"and w8, w8, #{self._RELAX_CSMASK:#x}")
+            + asm(f"orr w8, w8, #{self._RELAX_SETMASK:#x}")
             + asm("str w8, [x26]")
             + asm("mov w0, #0")
-            + branch_back
+            + success_branch_back
         )
 
-        for index in range(0, len(shellcode), 4):
+        for index in range(0, len(deny_shellcode), 4):
             self.emit(
-                cave + index,
-                shellcode[index : index + 4],
-                f"trampoline+{index} [_cred_label_update_execve tail relax]",
+                deny_cave + index,
+                deny_shellcode[index : index + 4],
+                f"deny_trampoline+{index} [_cred_label_update_execve C21-v3]",
             )
 
-        branch_to_cave = self._encode_b(tail_off, cave)
-        if not branch_to_cave:
-            self._log("  [-] branch from success tail to trampoline is out of range")
-            return False
+        for index in range(0, len(success_shellcode), 4):
+            self.emit(
+                success_cave + index,
+                success_shellcode[index : index + 4],
+                f"success_trampoline+{index} [_cred_label_update_execve C21-v3]",
+            )
 
+        deny_branch_to_cave = self._encode_b(deny_off, deny_cave)
+        if not deny_branch_to_cave:
+            self._log(f"  [-] branch from 0x{deny_off:X} to deny trampoline is out of range")
+            return False
         self.emit(
-            tail_off,
-            branch_to_cave,
-            "b cave [_cred_label_update_execve success-tail relax]",
+            deny_off,
+            deny_branch_to_cave,
+            f"b deny cave [_cred_label_update_execve C21-v3 exit @ 0x{deny_off:X}]",
         )
+
+        for off in success_exits:
+            branch_to_cave = self._encode_b(off, success_cave)
+            if not branch_to_cave:
+                self._log(f"  [-] branch from 0x{off:X} to success trampoline is out of range")
+                return False
+            self.emit(
+                off,
+                branch_to_cave,
+                f"b success cave [_cred_label_update_execve C21-v3 exit @ 0x{off:X}]",
+            )
 
         return True
