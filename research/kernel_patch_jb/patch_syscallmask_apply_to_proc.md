@@ -85,6 +85,37 @@ Validated behavior from disassembly:
 
 This matches the XNU setter semantics closely enough to trust the mapping.
 
+## Legacy Upstream Mapping
+
+The pasted legacy script matches the historical upstream `syscallmask` shellcode patch that this repo later labeled as C22.
+
+Concrete markers that identify it:
+
+- shellcode cave at `0xAB1740`
+- redirect from `0x2395584`
+- setup write at `0x2395530` (`mov x17, x0`)
+- tail branch to `_proc_set_syscall_filter_mask`
+- in-cave call to `_zalloc_ro_mut`
+
+Semantically, that upstream patch is **not** a destroy-path patch and **not** a plain early-return patch. It does this instead:
+
+1. If the incoming mask pointer is `NULL`, skip the custom work.
+2. Otherwise compute `ceil(mask_bits / 8)`.
+3. Use `_zalloc_ro_mut` to overwrite the target read-only mask storage with bytes sourced from an in-cave `0xFF` blob.
+4. Resume into `_proc_set_syscall_filter_mask`.
+
+This means the historical upstream intent was:
+
+- keep the mask object/path alive
+- but force the installed syscall/mach/kobj mask to become an **all-ones allow mask**
+
+That is an important semantic distinction from the newer `NULL`-mask strategy documented later in this file:
+
+- **legacy upstream shellcode** => installed mask exists and all bits are allowed
+- **proposed modern narrow patch** => installed mask pointer becomes `NULL`
+
+Both strategies bypass this mask-based interception layer in practice, but they are not identical. If we want the closest behavioral match to the historical upstream patch, the modern equivalent should preserve the setter path and write an all-ones mask, not simply early-return.
+
 ## What The Old C22 Implementation Actually Hit
 
 Historical runtime verification logged these writes:

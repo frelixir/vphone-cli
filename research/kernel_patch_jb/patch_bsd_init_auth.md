@@ -3,7 +3,7 @@
 ## Scope
 
 - Kernel analyzed: `kernelcache.research.vphone600`
-- Symbol source: `research/kernel_info/json/kernelcache.research.vphone600.bin.symbols.json`
+- Symbol handling: prefer in-image LC_SYMTAB if present; otherwise recover `bsd_init` from in-kernel string xrefs and local control-flow.
 - XNU reference: `research/reference/xnu/bsd/kern/bsd_init.c`
 - Analysis basis: IDA-MCP + local XNU source correlation
 
@@ -223,6 +223,7 @@ This rule is materially stronger than the old `ldr x0,[...,#0x2b8]; cbz; bl` sha
 
 ## Validation Status
 
+- Validation note: on the current reference IM4P kernel, in-image symbol resolution returns `0` symbols, so B13 is currently found by anchor recovery rather than external symbol data.
 - In-memory validation against `/Users/qaq/Documents/Firmwares/PCC-CloudOS-26.3-23D128/kernelcache.research.vphone600` succeeds after IM4P decompression.
 - `KernelJBPatcher._build_method_plan()` now includes `patch_bsd_init_auth`.
 - Live patch hit: `0xFFFFFE0007F7B98C` / file offset `0x00F7798C` / `CBNZ W0, panic` -> `NOP`.
