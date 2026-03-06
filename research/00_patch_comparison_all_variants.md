@@ -74,26 +74,26 @@
 
 ### JB-Only Kernel Methods (Reference List)
 
-Current default schedule note (2026-03-06): `patch_bsd_init_auth`, `patch_io_secure_bsd_root`, `patch_vm_fault_enter_prepare`, and `patch_cred_label_update_execve` are temporarily excluded from `_PATCH_METHODS` pending rework.
+Current default schedule note (2026-03-06): `patch_bsd_init_auth`, `patch_io_secure_bsd_root`, `patch_vm_fault_enter_prepare`, and `patch_cred_label_update_execve` are temporarily excluded from `_PATCH_METHODS` pending staged re-validation. Fresh IDA re-analysis shows JB-14 previously used a false-positive matcher; it now targets the real `_bsd_init` rootauth failure branch and is semantically redundant with base patch #3 when JB is layered on top of `fw_patch`. Group C remains commented out in `scripts/patchers/kernel_jb.py`, so `patch_syscallmask_apply_to_proc` is not currently active either; 2026-03-06 re-analysis shows its historical low-risk hit targeted `_profile_syscallmask_destroy` instead of the real apply layer `_proc_apply_syscall_masks`. For JB-16, the historical hit at `0xFFFFFE000836E1F0` is now treated as semantically wrong: it patches the `"SecureRoot"` name-check gate inside `AppleARMPE::callPlatformFunction`, not the `"SecureRootName"` deny return consumed by `IOSecureBSDRoot()`.
 
 | #     | Group | Method                                | Function                                   | Purpose                                                 | JB Enabled |
 | ----- | ----- | ------------------------------------- | ------------------------------------------ | ------------------------------------------------------- | :--------: |
 | JB-01 | A     | `patch_amfi_cdhash_in_trustcache`     | `AMFIIsCDHashInTrustCache`                 | Always return true + store hash                         |     Y      |
 | JB-02 | A     | `patch_amfi_execve_kill_path`         | AMFI execve kill return site               | Convert shared kill return from deny to allow           |     Y      |
-| JB-03 | C     | `patch_cred_label_update_execve`      | `_cred_label_update_execve`                | Early-return low-riskized cs_flags path                 |     Y      |
-| JB-04 | C     | `patch_hook_cred_label_update_execve` | `_hook_cred_label_update_execve`           | Low-riskized early-return hook gate                     |     Y      |
+| JB-03 | C     | `patch_cred_label_update_execve`      | `_cred_label_update_execve`                | Reworked: preserve AMFI exec-time flow, then clear restrictive success-path `csflags` in a tail trampoline; still disabled pending boot validation |     N      |
+| JB-04 | C     | `patch_hook_cred_label_update_execve` | currently mis-targets `sub_FFFFFE00093D2CE4`; intended target `_hook_cred_label_update_execve` | Disable sandbox exec-time label update + syscall-mask application; keep disabled until retargeted |     -      |
 | JB-05 | C     | `patch_kcall10`                       | `sysent[439]` (`SYS_kas_info` replacement) | Kernel arbitrary call from userspace                    |     Y      |
 | JB-06 | B     | `patch_post_validation_additional`    | `_postValidation` (additional)             | Disable SHA256-only hash-type reject                    |     Y      |
-| JB-07 | C     | `patch_syscallmask_apply_to_proc`     | `_syscallmask_apply_to_proc`               | Low-riskized early return for syscall mask gate         |     Y      |
+| JB-07 | C     | `patch_syscallmask_apply_to_proc`     | `_proc_apply_syscall_masks`                | Clear Unix/Mach/KOBJ masks via NULL writes; old `_profile_syscallmask_destroy` hit was wrong |     -      |
 | JB-08 | A     | `patch_task_conversion_eval_internal` | `_task_conversion_eval_internal`           | Allow task conversion                                   |     Y      |
 | JB-09 | A     | `patch_sandbox_hooks_extended`        | Sandbox MACF ops (extended)                | Stub remaining 30+ sandbox hooks (incl. IOKit 201..210) |     Y      |
 | JB-10 | A     | `patch_iouc_failed_macf`              | IOUC MACF shared gate                      | Bypass shared IOUserClient MACF deny path               |     Y      |
 | JB-11 | B     | `patch_proc_security_policy`          | `_proc_security_policy`                    | Bypass security policy                                  |     Y      |
 | JB-12 | B     | `patch_proc_pidinfo`                  | `_proc_pidinfo`                            | Allow pid 0 info                                        |     Y      |
 | JB-13 | B     | `patch_convert_port_to_map`           | `_convert_port_to_map_with_flavor`         | Skip kernel map panic                                   |     Y      |
-| JB-14 | B     | `patch_bsd_init_auth`                 | `_bsd_init` (2nd auth gate)                | Skip auth at @%s:%d                                     |     Y      |
+| JB-14 | B     | `patch_bsd_init_auth`                 | `_bsd_init` rootauth-failure branch        | Ignore `FSIOC_KERNEL_ROOTAUTH` failure in `bsd_init`; same gate as base patch #3 when layered |     Y      |
 | JB-15 | B     | `patch_dounmount`                     | `_dounmount`                               | Allow unmount (strict in-function match)                |     Y      |
-| JB-16 | B     | `patch_io_secure_bsd_root`            | `_IOSecureBSDRoot`                         | Skip secure root check (guard-site filter)              |     Y      |
+| JB-16 | B     | `patch_io_secure_bsd_root`            | `AppleARMPE::callPlatformFunction` (`"SecureRootName"` return select), called from `IOSecureBSDRoot` | Force `"SecureRootName"` policy return to success without altering callback flow |     Y      |
 | JB-17 | B     | `patch_load_dylinker`                 | `_load_dylinker`                           | Skip strict `LC_LOAD_DYLINKER == "/usr/lib/dyld"` gate  |     Y      |
 | JB-18 | B     | `patch_mac_mount`                     | `___mac_mount`                             | Bypass MAC mount deny path (strict site)                |     Y      |
 | JB-19 | B     | `patch_nvram_verify_permission`       | `_verifyPermission` (NVRAM)                | Allow NVRAM writes                                      |     Y      |
@@ -101,8 +101,10 @@ Current default schedule note (2026-03-06): `patch_bsd_init_auth`, `patch_io_sec
 | JB-21 | B     | `patch_spawn_validate_persona`        | `_spawn_validate_persona`                  | Skip persona validation                                 |     Y      |
 | JB-22 | B     | `patch_task_for_pid`                  | `_task_for_pid`                            | Allow task_for_pid                                      |     Y      |
 | JB-23 | B     | `patch_thid_should_crash`             | `_thid_should_crash`                       | Prevent GUARD_TYPE_MACH_PORT crash                      |     Y      |
-| JB-24 | B     | `patch_vm_fault_enter_prepare`        | `_vm_fault_enter_prepare`                  | Skip fault check                                        |     Y      |
+| JB-24 | B     | `patch_vm_fault_enter_prepare`        | `_vm_fault_enter_prepare`                  | Disabled: old matcher hits `pmap_lock_phys_page()` path |     Y      |
 | JB-25 | B     | `patch_vm_map_protect`                | `_vm_map_protect`                          | Allow VM protect                                        |     Y      |
+
+JB-24 note (2026-03-06): current `patch_vm_fault_enter_prepare` matching resolves to the `VM_PAGE_CONSUME_CLUSTERED()` lock/unlock sequence inside `vm_fault_enter_prepare`, i.e. `pmap_lock_phys_page()` / `pmap_unlock_phys_page()`, not a code-signing or deny-policy helper.
 
 ## CFW Installation Patches
 
@@ -193,8 +195,11 @@ Current default schedule note (2026-03-06): `patch_bsd_init_auth`, `patch_io_sec
   - `setup_logs/jb_patch_tests_20260306_115027` (2026-03-06): rerun after `status` fix, pending-only mode (`Total methods: 19`).
 - Final run result from `jb_patch_tests_20260306_115027` at `2026-03-06 13:17`:
   - Finished: 19/19 (`PASS=15`, `FAIL=4`, all fails `rc=2`).
-  - Failing methods: `patch_bsd_init_auth`, `patch_io_secure_bsd_root`, `patch_vm_fault_enter_prepare`, `patch_cred_label_update_execve`.
+  - Failing methods at that time: `patch_bsd_init_auth`, `patch_io_secure_bsd_root`, `patch_vm_fault_enter_prepare`, `patch_cred_label_update_execve`.
+  - 2026-03-06 follow-up: `patch_io_secure_bsd_root` failure is now attributed to a wrong-site patch in `AppleARMPE::callPlatformFunction` (`"SecureRoot"` gate at `0xFFFFFE000836E1F0`), not the intended `"SecureRootName"` deny-return path.
+  - 2026-03-06 follow-up: `patch_bsd_init_auth` was retargeted after confirming the old matcher was hitting unrelated code; keep disabled in default schedule until a fresh clean-baseline boot test passes.
   - Final case: `[19/19] patch_syscallmask_apply_to_proc` (`PASS`).
+  - 2026-03-06 re-analysis: that historical `PASS` is now treated as a false positive for functionality, because the recorded bytes landed at `0xfffffe00093ae6e4`/`0xfffffe00093ae6e8` inside `_profile_syscallmask_destroy` underflow handling, not in `_proc_apply_syscall_masks`.
   - Observed failure symptom in current failing set: first boot panic before command injection (or boot process early exit).
 - Post-run schedule change (per user request):
   - commented out failing methods from default `KernelJBPatcher._PATCH_METHODS` schedule in `scripts/patchers/kernel_jb.py`:
@@ -202,6 +207,10 @@ Current default schedule note (2026-03-06): `patch_bsd_init_auth`, `patch_io_sec
     - `patch_io_secure_bsd_root`
     - `patch_vm_fault_enter_prepare`
     - `patch_cred_label_update_execve`
+- 2026-03-06 re-research note for `patch_cred_label_update_execve`:
+  - old entry-time early-return strategy was identified as boot-unsafe because it skipped AMFI exec-time `csflags` and entitlement propagation entirely.
+  - implementation was reworked to a success-tail trampoline that preserves normal AMFI processing and only clears restrictive `csflags` bits on the success path.
+  - default JB schedule still keeps the method disabled until the reworked strategy is boot-validated.
 - Manual DEV+single (`setup_machine` + `PATCH=<method>`) working set now includes:
   - `patch_amfi_cdhash_in_trustcache`
   - `patch_amfi_execve_kill_path`

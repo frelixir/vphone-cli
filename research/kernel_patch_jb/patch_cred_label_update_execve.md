@@ -1,203 +1,116 @@
 # C21 `patch_cred_label_update_execve`
 
-## Scope (revalidated with static analysis)
+## Scope
 
-- Target patch method: `KernelJBPatchCredLabelMixin.patch_cred_label_update_execve` in `scripts/patchers/kernel_jb_patch_cred_label.py`.
-- Target function in kernel: `jb_c21_patch_target_amfi_cred_label_update_execve` (`0xFFFFFE000863FC6C`).
-- Patch-point label (inside function): `jb_c21_patchpoint_retab_redirect` (`0xFFFFFE000864011C`, original `RETAB` site).
+- Kernel used for reverse engineering: `kernelcache.research.vphone600`.
+- IDA symbol / address: `__Z25_cred_label_update_execveP5ucredS0_P4procP5vnodexS4_P5labelS6_S6_PjPvmPi` at `0xFFFFFE000864DEFC`.
+- XNU semantic reference: `research/reference/xnu/security/mac_vfs.c`, `research/reference/xnu/bsd/kern/kern_exec.c`, `research/reference/xnu/bsd/kern/kern_credential.c`, `research/reference/xnu/osfmk/kern/cs_blobs.h`.
 
-## Verified call/dispatch trace (no trust in old notes)
+This note is a fresh re-analysis. Older notes for this patch were treated as untrusted and not reused as ground truth.
 
-1. Exec pipeline enters `jb_c21_supp_exec_handle_image` (`0xFFFFFE0007FA4A58`).
-2. It calls `jb_c21_supp_exec_policy_stage` (`0xFFFFFE0007FA6858`).
-3. That stage schedules `jb_c21_supp_exec_policy_wrapper` (`0xFFFFFE0007F81F00`).
-4. Wrapper calls `jb_c21_supp_mac_policy_dispatch_ops90_execve` (`0xFFFFFE00082D9D0C`).
-5. Dispatcher loads callback from `policy->ops + 0x90` at `jb_c21_supp_dispatch_load_ops_off90` (`0xFFFFFE00082D9DBC`) and calls it at `jb_c21_supp_dispatch_call_ops_off90` (`0xFFFFFE00082D9FCC`, `BLRAA ... X17=#0xEC79`).
+## Call Stack
 
-This `+0x90` slot is the shared execve cred-label hook slot used by both AMFI and Sandbox hooks.
+Exec-time path in XNU source:
 
-## How AMFI wires this callback
+1. `exec_handle_sugid()` asks `mac_cred_check_label_update_execve(...)` whether any MAC policy wants an exec-time credential transition.
+2. If yes, `exec_handle_sugid()` calls `kauth_proc_label_update_execve(...)`.
+3. `kauth_proc_label_update_execve(...)` allocates / updates the new credential and calls `mac_cred_label_update_execve(...)`.
+4. `mac_cred_label_update_execve(...)` iterates `mac_policy_list` and invokes each policy's `mpo_cred_label_update_execve` hook.
+5. AMFI's hook is `_cred_label_update_execve` in `com.apple.driver.AppleMobileFileIntegrity`.
 
-- `jb_c21_supp_amfi_init_register_policy_ops` (`0xFFFFFE0008640718`) builds AMFI `mac_policy_ops` and writes `jb_c21_patch_target_amfi_cred_label_update_execve` into offset `+0x90` (store at `0xFFFFFE0008640AA0`).
-- Then it registers the policy descriptor via `sub_FFFFFE00082CDDB0` (mac policy register path).
+Relevant source anchors:
 
-## What the unpatched function enforces
+- `research/reference/xnu/bsd/kern/kern_exec.c:6854`
+- `research/reference/xnu/bsd/kern/kern_exec.c:6950`
+- `research/reference/xnu/bsd/kern/kern_credential.c:4367`
+- `research/reference/xnu/security/mac_vfs.c:777`
 
-Inside `jb_c21_patch_target_amfi_cred_label_update_execve`:
+## What The Function Actually Does
 
-- Multiple explicit kill paths return failure (`W0=1`) for unsigned/forbidden exec cases.
-- A key branch logs and kills with:
-  - `"dyld signature cannot be verified... or ... unsigned application outside of a supported development configuration"`
-- It conditionally mutates `*a10` (`cs_flags`) and later checks validity bits before honoring entitlements.
-- If validity path is not satisfied, it logs `"not CS_VALID, not honoring entitlements"` and skips entitlement-driven flag propagation.
+Reverse engineering of `0xFFFFFE000864DEFC` shows that AMFI's hook is not just a boolean kill gate.
 
-## Why C21 is required (full picture)
+It performs all of the following before returning success or failure:
 
-C21 is not just another allow-return patch; it is a **state-fix patch** for `cs_flags` at execve policy time.
+- validates the exec target / `cs_blob` and reports AMFI analytics;
+- checks multiple kill conditions and returns `1` on rejection;
+- mutates `*csflags` during successful exec handling;
+- derives extra flags from entitlement state;
+- performs final bookkeeping before returning `0`.
 
-Patch shellcode behavior (from patcher implementation):
+Observed kill / deny subpaths in IDA:
 
-- Load `cs_flags` pointer from stack (`arg9` path).
-- `ORR` with `0x04000000` and `0x0000000F`.
-- `AND` with `0xFFFFC0FF` (clears bits in `0x00003F00`).
-- Store back and return success (`X0=0`).
+- completely unsigned code path;
+- Restricted Execution Mode denials;
+- legacy VPN plugin rejection;
+- dyld signature verification failure;
+- helper failure from `sub_FFFFFE000864E5A0(...)` with reason string.
 
-Practical effect:
+All of those failure edges converge on the shared kill return at `0xFFFFFE000864E38C` (`mov w0, #1`).
 
-- Unsigned binaries avoid AMFI execve kill outcomes **and** get permissive execution flags instead of failing later due bad flag state.
-- For launchd dylib injection (`/cores/launchdhook.dylib`), this patch is critical because the unpatched path can still fail on dyld-signature / restrictive-flag checks even if a generic kill-return patch exists elsewhere.
-- Clearing the `0x3F00` cluster and forcing low/upper bits ensures launch context is treated permissively enough for injected non-Apple-signed payload flow.
+Observed success-path `csflags` mutations in IDA:
 
-## Relationship with Sandbox hook (important)
+- `0xFFFFFE000864E1E8`: ORs `0x2200` or `0x200` into `*csflags` depending on dyld / helper state.
+- `0xFFFFFE000864E200`: ORs `0x802A00` into `*csflags` when AMFI-derived entitlement flags require SIP-style inheritance.
+- `0xFFFFFE000864E4EC`, `0xFFFFFE000864E500`, `0xFFFFFE000864E51C`, `0xFFFFFE000864E534`: OR installer / rootless / datavault / NVRAM-related bits into `*csflags`.
+- `0xFFFFFE000864E570`: ORs `0x2A00` into `*csflags` in the final success tail.
 
-- Sandbox also has a cred-label execve hook in the same ops slot (`+0x90`):
-  - `jb_c21_supp_sandbox_hook_cred_label_update_execve` (`0xFFFFFE00093BDB64`)
-- That Sandbox hook contains policy such as `"only launchd is allowed to spawn untrusted binaries"`.
+The relevant flag meanings from XNU are in `research/reference/xnu/osfmk/kern/cs_blobs.h:32`.
 
-So launchd-dylib viability depends on **combined behavior**:
+## Why The Old Patch Broke Boot
 
-- Sandbox hook policy acceptance for launch context, and
-- AMFI C21 flag/state coercion so dyld/code-signing state does not re-kill or strip required capability.
+The previous implementations were both too broad:
 
-## IDA labels added in this verification pass
+1. the original shellcode version forged new `csflags` at function exit;
+2. the later "low-risk" version simply returned from function entry.
 
-- **patched-function group**:
-  - `jb_c21_patch_target_amfi_cred_label_update_execve` @ `0xFFFFFE000863FC6C`
-  - `jb_c21_patchpoint_retab_redirect` @ `0xFFFFFE000864011C`
-  - `jb_c21_ref_shared_kill_return` @ `0xFFFFFE00086400FC`
-- **supplement group**:
-  - `jb_c21_supp_exec_handle_image` @ `0xFFFFFE0007FA4A58`
-  - `jb_c21_supp_exec_policy_stage` @ `0xFFFFFE0007FA6858`
-  - `jb_c21_supp_exec_policy_wrapper` @ `0xFFFFFE0007F81F00`
-  - `jb_c21_supp_mac_policy_dispatch_ops90_execve` @ `0xFFFFFE00082D9D0C`
-  - `jb_c21_supp_dispatch_load_ops_off90` @ `0xFFFFFE00082D9DBC`
-  - `jb_c21_supp_dispatch_call_ops_off90` @ `0xFFFFFE00082D9FCC`
-  - `jb_c21_supp_amfi_start` @ `0xFFFFFE0008640624`
-  - `jb_c21_supp_amfi_init_register_policy_ops` @ `0xFFFFFE0008640718`
-  - `jb_c21_supp_sandbox_hook_cred_label_update_execve` @ `0xFFFFFE00093BDB64`
-  - `jb_c21_supp_sandbox_execve_context_gate` @ `0xFFFFFE00093BC054`
+The entry-return strategy is fundamentally wrong for boot stability because it skips AMFI's normal exec-time work entirely.
 
-## Symbol Consistency Audit (2026-03-05)
+That means it bypasses:
 
-- Status: `partial`
-- Recovered symbol `_hook_cred_label_update_execve` is present and consistent.
-- Many `jb_*` helper names in this file are analyst aliases and do not all appear in recovered symbol JSON.
+- `cs_blob` / signature-state handling;
+- AMFI auxiliary analytics / bookkeeping;
+- entitlement-derived `csflags` propagation;
+- final per-exec state setup that later code expects to have happened.
 
-## Patch Metadata
+In short: `_cred_label_update_execve` is on the boot-critical exec path, so turning it into an unconditional `return 0` is not a safe jailbreak strategy.
 
-- Patch document: `patch_cred_label_update_execve.md` (C21).
-- Primary patcher module: `scripts/patchers/kernel_jb_patch_cred_label.py`.
-- Analysis mode: static binary analysis (IDA-MCP + disassembly + recovered symbols), no runtime patch execution.
+## Repaired Patch Strategy
 
-## Patch Goal
+The new patcher no longer returns from function entry.
 
-Redirect cred-label execve handling to shellcode that coerces permissive cs_flags and returns success.
+Instead it:
 
-## Target Function(s) and Binary Location
+1. keeps AMFI's full exec-time logic intact;
+2. locates the final success tail while `x26 == csflags` is still live;
+3. redirects that tail to a small trampoline;
+4. clears only the restrictive execution bits from `*csflags`;
+5. branches back into the original epilogue.
 
-- Primary target: AMFI cred-label callback body at `0xfffffe000863fc6c`.
-- Patchpoint: `0xfffffe000864011c` (`retab` redirect to injected shellcode/cave).
+The current trampoline clears this mask:
 
-## Kernel Source File Location
+- `CS_HARD`
+- `CS_KILL`
+- `CS_CHECK_EXPIRATION`
+- `CS_RESTRICT`
+- `CS_ENFORCEMENT`
+- `CS_REQUIRE_LV`
 
-- Component: AMFI policy callback implementation in kernel collection (private).
-- Related open-source MAC framework context: `security/mac_process.c` + exec paths in `bsd/kern/kern_exec.c`.
-- Confidence: `medium`.
+Bitmask used by the patcher: `0xFFFFC0FF`.
 
-## Function Call Stack
+This preserves AMFI's normal validation / entitlement work while removing the sticky exec-time restrictions that are most hostile to jailbreak tooling.
 
-- Primary traced chain (from `Verified call/dispatch trace (no trust in old notes)`):
-- 1. Exec pipeline enters `jb_c21_supp_exec_handle_image` (`0xFFFFFE0007FA4A58`).
-- 2. It calls `jb_c21_supp_exec_policy_stage` (`0xFFFFFE0007FA6858`).
-- 3. That stage schedules `jb_c21_supp_exec_policy_wrapper` (`0xFFFFFE0007F81F00`).
-- 4. Wrapper calls `jb_c21_supp_mac_policy_dispatch_ops90_execve` (`0xFFFFFE00082D9D0C`).
-- 5. Dispatcher loads callback from `policy->ops + 0x90` at `jb_c21_supp_dispatch_load_ops_off90` (`0xFFFFFE00082D9DBC`) and calls it at `jb_c21_supp_dispatch_call_ops_off90` (`0xFFFFFE00082D9FCC`, `BLRAA ... X17=#0xEC79`).
-- The upstream entry(s) and patched decision node are linked by direct xref/callsite evidence in this file.
+## Intended Effect
 
-## Patch Hit Points
+After the repaired patch:
 
-- Patch hitpoint is selected by contextual matcher and verified against local control-flow.
-- Before/after instruction semantics are captured in the patch-site evidence above.
+- AMFI still runs its normal exec-time hook and keeps boot-critical side effects intact.
+- Exec success remains driven by the existing AMFI flow; kill-return bypass is still handled separately by `patch_amfi_execve_kill_path`.
+- Successfully launched processes end up with a less restrictive `csflags` set, especially around kill / hard / library-validation style behavior.
 
-## Current Patch Search Logic
+This is a much narrower and more defensible jailbreak patch than forcing an unconditional success return at function entry.
 
-- Implemented in `scripts/patchers/kernel_jb_patch_cred_label.py`.
-- Site resolution uses anchor + opcode-shape + control-flow context; ambiguous candidates are rejected.
-- The patch is applied only after a unique candidate is confirmed in-function.
-- Uses string anchors + instruction-pattern constraints + structural filters (for example callsite shape, branch form, register/imm checks).
+## Current Status
 
-## Pseudocode (Before)
-
-```c
-if (amfi_checks_fail || cs_flags_invalid) {
-    return 1;
-}
-return apply_default_execve_flags(...);
-```
-
-## Pseudocode (After)
-
-```c
-cs_flags |= 0x04000000 | 0x0000000F;
-cs_flags &= 0xFFFFC0FF;
-return 0;
-```
-
-## Validation (Static Evidence)
-
-- Verified with IDA-MCP disassembly/decompilation, xrefs, and callgraph context for the selected site.
-- Cross-checked against recovered symbols in `research/kernel_info/json/kernelcache.research.vphone600.bin.symbols.json`.
-- Address-level evidence in this document is consistent with patcher matcher intent.
-
-## Expected Failure/Panic if Unpatched
-
-- Exec policy path preserves restrictive `cs_flags` and deny returns, causing AMFI kill outcomes or later entitlement-state failures.
-
-## Risk / Side Effects
-
-- This patch weakens a kernel policy gate by design and can broaden behavior beyond stock security assumptions.
-- Potential side effects include reduced diagnostics fidelity and wider privileged surface for patched workflows.
-
-## Symbol Consistency Check
-
-- Recovered-symbol status in `kernelcache.research.vphone600.bin.symbols.json`: `partial`.
-- Canonical symbol hit(s): none (alias-based static matching used).
-- Where canonical names are absent, this document relies on address-level control-flow and instruction evidence; analyst aliases are explicitly marked as aliases.
-- IDA-MCP lookup snapshot (2026-03-05): `0xfffffe000863fc6c` currently resolves to `__ZN18AppleMobileApNonce21_saveNonceInfoInNVRAMEPKc` (size `0x250`).
-
-## Open Questions and Confidence
-
-- Open question: symbol recovery is incomplete for this path; aliases are still needed for parts of the call chain.
-- Overall confidence for this patch analysis: `medium` (address-level semantics are stable, symbol naming is partial).
-
-## Evidence Appendix
-
-- Detailed addresses, xrefs, and rationale are preserved in the existing analysis sections above.
-- For byte-for-byte patch details, refer to the patch-site and call-trace subsections in this file.
-
-## Runtime + IDA Verification (2026-03-05)
-
-- Verification timestamp (UTC): `2026-03-05T14:55:58.795709+00:00`
-- Kernel input: `/Users/qaq/Documents/Firmwares/PCC-CloudOS-26.3-23D128/kernelcache.research.vphone600`
-- Base VA: `0xFFFFFE0007004000`
-- Runtime status: `hit` (2 patch writes, method_return=True)
-- Included in `KernelJBPatcher.find_all()`: `True`
-- IDA mapping: `2/2` points in recognized functions; `0` points are code-cave/data-table writes.
-- IDA mapping status: `ok` (IDA runtime mapping loaded.)
-- Call-chain mapping status: `ok` (IDA call-chain report loaded.)
-- Call-chain validation: `1` function nodes, `3` patch-point VAs.
-- IDA function sample: `__Z25_cred_label_update_execveP5ucredS0_P4procP5vnodexS4_P5labelS6_S6_PjPvmPi`
-- Chain function sample: `__Z25_cred_label_update_execveP5ucredS0_P4procP5vnodexS4_P5labelS6_S6_PjPvmPi`
-- Caller sample: `__ZL35_initializeAppleMobileFileIntegrityv`
-- Callee sample: `__Z25_cred_label_update_execveP5ucredS0_P4procP5vnodexS4_P5labelS6_S6_PjPvmPi`, `__ZN24AppleMobileFileIntegrity27submitAuxiliaryInfoAnalyticEP5vnodeP7cs_blob`, `sub_FFFFFE0007B4EA8C`, `sub_FFFFFE0007CD7750`, `sub_FFFFFE0007CD7760`, `sub_FFFFFE0007F8C478`
-- Verdict: `valid`
-- Recommendation: Keep enabled for this kernel build; continue monitoring for pattern drift.
-- Policy note: method is in the low-risk optimized set (validated hit on this kernel).
-- Key verified points:
-- `0xFFFFFE000864DF00` (`__Z25_cred_label_update_execveP5ucredS0_P4procP5vnodexS4_P5labelS6_S6_PjPvmPi`): mov x0,xzr [_cred_label_update_execve low-risk] | `ff4302d1 -> e0031faa`
-- `0xFFFFFE000864DF04` (`__Z25_cred_label_update_execveP5ucredS0_P4procP5vnodexS4_P5labelS6_S6_PjPvmPi`): retab [_cred_label_update_execve low-risk] | `fc6f03a9 -> ff0f5fd6`
-- Artifacts: `research/kernel_patch_jb/runtime_verification/runtime_verification_report.json`
-- Artifacts: `research/kernel_patch_jb/runtime_verification/ida_runtime_patch_points.json`
-- Artifacts: `research/kernel_patch_jb/runtime_verification/ida_patch_chain_report.json`
-- Artifacts: `research/kernel_patch_jb/runtime_verification/ida_patch_chain_report.md`
-<!-- END_RUNTIME_IDA_VERIFICATION_2026_03_05 -->
+- Patch implementation updated in `scripts/patchers/kernel_jb_patch_cred_label.py`.
+- Default schedule remains disabled in `scripts/patchers/kernel_jb.py` until boot validation is rerun.
+- If this patch still fails, the next suspect is not AMFI's kill return itself, but over-broad `csflags` relaxation semantics for specific early-boot binaries.
