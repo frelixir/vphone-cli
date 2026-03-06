@@ -27,6 +27,12 @@ The semantically correct deny path for the `IOSecureBSDRoot(rootdevice)` flow is
 
 That patch preserves the compare, callback, wakeup, and state updates, and only forces the final policy return from `kIOReturnNotPrivileged` to success.
 
+## Implementation Status
+
+- `scripts/patchers/kernel_jb_patch_secure_root.py` was retargeted on 2026-03-06 to emit this `0x0136A464` patch instead of the historical `0x0136A1F0` false-positive branch rewrite.
+- `scripts/patchers/kernel_jb.py` now includes `patch_io_secure_bsd_root` again in `_GROUP_B_METHODS` with the retargeted matcher.
+- Local dry-run verification on the research kernel emits exactly one write: `0x0136A464` / `16008052` / `mov w22, #0 [_IOSecureBSDRoot SecureRootName allow]`.
+
 ## Verified Call Chain
 
 ### 1. BSD boot calls `IOSecureBSDRoot`

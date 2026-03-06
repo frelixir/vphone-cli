@@ -77,7 +77,7 @@ class KernelJBPatcher(
         "patch_convert_port_to_map",  # JB-13 / B8
         "patch_bsd_init_auth",  # JB-14 / B13 (retargeted 2026-03-06 to real _bsd_init rootauth gate)
         "patch_dounmount",  # JB-15 / B12
-        # "patch_io_secure_bsd_root",  # JB-16 / B19 (disabled: autotest FAIL rc=2 on 2026-03-06)
+        "patch_io_secure_bsd_root",  # JB-16 / B19 (retargeted 2026-03-06 to SecureRootName deny-return)
         "patch_load_dylinker",  # JB-17 / B16
         "patch_mac_mount",  # JB-18 / B11
         "patch_nvram_verify_permission",  # JB-19 / B18
