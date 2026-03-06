@@ -76,72 +76,106 @@ class KernelJBPatchHookCredLabelMixin:
 
         return -1
 
-    def patch_hook_cred_label_update_execve(self):
-        """Low-risk early-return patch for sandbox cred-label hook.
+    def _find_hook_cred_label_update_execve_target(self):
+        """Locate the real sandbox execve hook body, not its MAC wrapper."""
+        hook_off = self._resolve_symbol("_hook_cred_label_update_execve")
+        if hook_off >= 0 and any(s <= hook_off < e for s, e in self.code_ranges):
+            self._log(f"  [+] _hook_cred_label_update_execve symbol -> 0x{hook_off:X}")
+            return hook_off
 
-        Keep PACIBSP at entry and patch following instructions to:
-          mov x0, xzr
-          retab
-        This avoids ops-table rewrites, code caves, and long trampolines.
-        """
-        self._log("\n[JB] _hook_cred_label_update_execve: low-risk early return")
-
-        # Find sandbox ops table
         ops_table = self._find_sandbox_ops_table_via_conf()
         if ops_table is None:
             self._log("  [-] sandbox ops table not found")
+            return -1
+
+        wrapper = self._read_ops_entry(ops_table, 18)
+        if wrapper is None or wrapper <= 0:
+            self._log("  [-] mac_policy_ops[18] entry missing")
+            return -1
+        if not any(s <= wrapper < e for s, e in self.code_ranges):
+            self._log(f"  [-] mac_policy_ops[18] points outside code: 0x{wrapper:X}")
+            return -1
+
+        self._log(f"  [*] mac_policy_ops[18] wrapper at 0x{wrapper:X}")
+
+        sandbox_create = self._resolve_symbol("_sandbox_create")
+        proc_apply_masks = self._resolve_symbol("_proc_apply_syscall_masks")
+        label_set_sandbox = self._resolve_symbol("_label_set_sandbox")
+        needed = {sandbox_create, proc_apply_masks, label_set_sandbox} - {-1}
+
+        def bl_targets(func_start, max_size):
+            targets = set()
+            func_end = self._find_func_end(func_start, max_size)
+            for off in range(func_start, func_end, 4):
+                insn = _rd32(self.raw, off)
+                if (insn >> 26) != 0x25:
+                    continue
+                imm26 = insn & 0x3FFFFFF
+                if imm26 & (1 << 25):
+                    imm26 -= 1 << 26
+                target = off + imm26 * 4
+                if any(s <= target < e for s, e in self.code_ranges):
+                    targets.add(target)
+            return targets
+
+        wrapper_targets = bl_targets(wrapper, 0x1400)
+        for target in sorted(wrapper_targets):
+            if self.raw[target : target + 4] != PACIBSP:
+                continue
+            target_calls = bl_targets(target, 0x800)
+            if needed and not needed.issubset(target_calls):
+                continue
+            self._log(f"  [+] wrapper calls hook candidate 0x{target:X}")
+            return target
+
+        self._log("  [-] unable to resolve real hook body from wrapper")
+        return -1
+
+    def patch_hook_cred_label_update_execve(self):
+        """Force the sandbox hook down its no-sandbox transition path.
+
+        The old implementation patched the wrapper selected from
+        `mac_policy_ops[18]` and returned immediately, which skips the
+        hook's label/syscall-mask housekeeping and can leave the new exec
+        credential with inherited parent sandbox state.
+
+        Safer strategy:
+          - resolve the real `_hook_cred_label_update_execve` body,
+          - patch `ldr x0, [x0]` to `mov x0, #1`,
+          - let the existing `cmp x0, #1; b.eq ...` flow clear/reset the
+            sandbox state through the normal success path.
+        """
+        self._log("\n[JB] _hook_cred_label_update_execve: force no-sandbox path")
+
+        hook_off = self._find_hook_cred_label_update_execve_target()
+        if hook_off < 0:
             return False
 
-        # ── 3. Find hook index dynamically ───────────────────────
-        # mpo_cred_label_update_execve is one of the largest sandbox
-        # hooks at an early index (< 30).  Scan for it.
-        hook_index = -1
-        orig_hook = -1
-        best_size = 0
-        for idx in range(0, 30):
-            entry = self._read_ops_entry(ops_table, idx)
-            if entry is None or entry <= 0:
-                continue
-            if not any(s <= entry < e for s, e in self.code_ranges):
-                continue
-            fend = self._find_func_end(entry, 0x2000)
-            fsize = fend - entry
-            if fsize > best_size:
-                best_size = fsize
-                hook_index = idx
-                orig_hook = entry
-
-        if hook_index < 0 or best_size < 1000:
+        if self.raw[hook_off : hook_off + 4] != PACIBSP:
             self._log(
-                "  [-] hook entry not found in ops table "
-                f"(best: idx={hook_index}, size={best_size})"
+                f"  [-] hook prologue is not PACIBSP "
+                f"(got 0x{_rd32(self.raw, hook_off):08X})"
             )
             return False
 
-        self._log(f"  [+] hook at ops[{hook_index}] = 0x{orig_hook:X} ({best_size} bytes)")
-
-        # Verify first instruction is PACIBSP
-        first_insn = self.raw[orig_hook : orig_hook + 4]
-        if first_insn != PACIBSP:
+        load_mode_off = hook_off + 0x44
+        if _rd32(self.raw, load_mode_off) != 0xF9400000:  # ldr x0, [x0]
             self._log(
-                f"  [-] first insn not PACIBSP "
-                f"(got 0x{_rd32(self.raw, orig_hook):08X})"
+                f"  [-] unexpected mode-load insn at 0x{load_mode_off:X}: "
+                f"0x{_rd32(self.raw, load_mode_off):08X}"
             )
             return False
 
-        func_end = self._find_func_end(orig_hook, 0x2000)
-        if func_end <= orig_hook + 8:
-            self._log("  [-] hook function too small for low-risk patch")
+        if _rd32(self.raw, hook_off + 0x48) != 0xF100041F:  # cmp x0, #1
+            self._log(
+                f"  [-] unexpected cmp at 0x{hook_off + 0x48:X}: "
+                f"0x{_rd32(self.raw, hook_off + 0x48):08X}"
+            )
             return False
-        self.emit(
-            orig_hook + 4,
-            asm("mov x0, xzr"),
-            "mov x0,xzr [_hook_cred_label_update_execve low-risk]",
-        )
-        self.emit(
-            orig_hook + 8,
-            bytes([0xFF, 0x0F, 0x5F, 0xD6]),  # retab
-            "retab [_hook_cred_label_update_execve low-risk]",
-        )
 
+        self.emit(
+            load_mode_off,
+            asm("mov x0, #1"),
+            "mov x0,#1 [_hook_cred_label_update_execve force no-sandbox path]",
+        )
         return True

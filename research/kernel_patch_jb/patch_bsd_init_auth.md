@@ -221,6 +221,20 @@ If B13 is reimplemented, the matcher should anchor on facts unique to this site:
 
 This rule is materially stronger than the old `ldr x0,[...,#0x2b8]; cbz; bl` shape and should exclude `exec_handle_sugid` entirely.
 
+## Validation Status
+
+- In-memory validation against `/Users/qaq/Documents/Firmwares/PCC-CloudOS-26.3-23D128/kernelcache.research.vphone600` succeeds after IM4P decompression.
+- `KernelJBPatcher._build_method_plan()` now includes `patch_bsd_init_auth`.
+- Live patch hit: `0xFFFFFE0007F7B98C` / file offset `0x00F7798C` / `CBNZ W0, panic` -> `NOP`.
+- Historical false-positive hit `0xFFFFFE0007FB09DC` is no longer selected.
+
+## Implementation Status
+
+- Landed in `scripts/patchers/kernel_jb_patch_bsd_init_auth.py`.
+- Default JB schedule re-enabled in `scripts/patchers/kernel_jb.py`.
+- Implemented form: patch the in-function `CBNZ W0, panic` gate in `bsd_init`.
+- Capstone semantic checks only: no raw-offset targeting and no operand-string/literal hardcoding in the final matcher.
+
 ## Confidence
 
 - Confidence that `0xFFFFFE0007F7B988` / `0xFFFFFE0007F7B98C` is the real B13 site: **high**.

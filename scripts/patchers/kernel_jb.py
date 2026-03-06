@@ -75,7 +75,7 @@ class KernelJBPatcher(
         "patch_proc_security_policy",  # JB-11 / B6
         "patch_proc_pidinfo",  # JB-12 / B7
         "patch_convert_port_to_map",  # JB-13 / B8
-        # "patch_bsd_init_auth",  # JB-14 / B13 (disabled: autotest FAIL rc=2 on 2026-03-06)
+        "patch_bsd_init_auth",  # JB-14 / B13 (retargeted 2026-03-06 to real _bsd_init rootauth gate)
         "patch_dounmount",  # JB-15 / B12
         # "patch_io_secure_bsd_root",  # JB-16 / B19 (disabled: autotest FAIL rc=2 on 2026-03-06)
         "patch_load_dylinker",  # JB-17 / B16
@@ -91,10 +91,10 @@ class KernelJBPatcher(
 
     # Group C: Shellcode/trampoline heavy methods.
     _GROUP_C_METHODS = (
-        # "patch_cred_label_update_execve",  # JB-03 / C21 (disabled: autotest FAIL rc=2 on 2026-03-06)
-        "patch_hook_cred_label_update_execve",  # JB-04 / C23 (low-riskized)
-        "patch_kcall10",  # JB-05 / C24 (low-riskized)
-        "patch_syscallmask_apply_to_proc",  # JB-07 / C22
+        # "patch_cred_label_update_execve",  # JB-03 / C21 (disabled: reworked on 2026-03-06, pending boot revalidation)
+        # "patch_hook_cred_label_update_execve",  # JB-04 / C23 (low-riskized)
+        # "patch_kcall10",  # JB-05 / C24 (low-riskized)
+        # "patch_syscallmask_apply_to_proc",  # JB-07 / C22
     )
 
     # Active JB patch schedule (known failing methods are temporarily excluded).
